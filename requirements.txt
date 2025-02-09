@@ -1,2 +1,4 @@
-requests
-bs4
+requests~=2.32.3
+bs4~=0.0.2
+beautifulsoup4~=4.13.3
+urllib3~=2.3.0

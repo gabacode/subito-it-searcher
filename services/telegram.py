@@ -46,6 +46,10 @@ class TelegramService:
         >>> self.send_telegram_messages(["message1", "message2"])
         """
         for msg in messages:
-            request_url = "https://api.telegram.org/bot" + self.apiCredentials["token"] + "/sendMessage?chat_id=" + \
-                          self.apiCredentials["chatid"] + "&text=" + msg
-            requests.get(request_url)
+            try:
+                request_url = "https://api.telegram.org/bot" + self.apiCredentials["token"] + "/sendMessage?chat_id=" + \
+                              self.apiCredentials["chatid"] + "&text=" + msg
+                requests.get(request_url)
+            except Exception as e:
+                print(f"Error sending message to telegram: {e}")
+                continue

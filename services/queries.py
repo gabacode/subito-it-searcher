@@ -1,10 +1,13 @@
 import json
 import os
 import re
+import time
 from datetime import datetime
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3 import Retry
 
 from services.telegram import TelegramService
 
@@ -14,6 +17,28 @@ class QueryManager:
         self.queries = dict()
         self.dbFile = "searches.tracked"
         self.telegram = telegram
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        self.session = self._create_session()
+
+    def _create_session(self):
+        """Create a requests session with retry strategy"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.headers.update(self.headers)
+        return session
 
     def load_queries(self):
         """A function to load the queries from the json file"""
@@ -25,8 +50,10 @@ class QueryManager:
 
     def save_queries(self):
         """A function to save the queries"""
+        print(f"Attempting to save queries to {self.dbFile}")
         with open(self.dbFile, 'w') as file:
             file.write(json.dumps(self.queries))
+        print("Save completed")
 
     def add(self, url, name, minPrice, maxPrice):
         """ A function to add a new query
@@ -98,99 +125,149 @@ class QueryManager:
                         print("\n")
             i += 1
 
+    def _make_request(self, url, attempt, retry_delay):
+        """Handle the HTTP request with retries and validation"""
+        time.sleep(retry_delay + (attempt * 1))
+        response = self.session.get(url, timeout=10)
+        response.raise_for_status()
+
+        if 'Access Denied' in response.text:
+            raise ValueError(f"Access denied on attempt {attempt + 1}")
+
+        return response
+
+    @staticmethod
+    def _parse_price(price_element, title):
+        """Extract and parse price from a product element"""
+        if not price_element:
+            print(f"No price found for item {title}")
+            return None
+
+        price_text = price_element.get_text().strip()
+        price = ''.join(c for c in price_text if c.isdigit() or c == '.')
+
+        if not price:
+            print(f"Could not extract numeric price from {price_text} for item {title}")
+            return None
+
+        return int(float(price))
+
+    @staticmethod
+    def _parse_location(product, title):
+        """Extract location information from a product element"""
+        try:
+            town = product.find('span', re.compile(r'town')).string
+            city = product.find('span', re.compile(r'city')).string
+            return town + city
+        except AttributeError:
+            print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + f" Unknown location for item {title}")
+            return "Unknown location"
+
+    def _handle_product(self, product, name, url, minPrice, maxPrice):
+        """Process a single product and return message if it's new"""
+        title = product.find('h2').string
+
+        try:
+            price_element = product.find('p', class_=re.compile(r'price'))
+            price = self._parse_price(price_element, title)
+            if price is None:
+                return None, False
+        except (AttributeError, ValueError) as e:
+            print(f"Error parsing price for item {title}: {str(e)}")
+            price = "Unknown price"
+
+        link = product.find('a').get('href')
+
+        # Handle sold items
+        sold = product.find('span', re.compile(r'item-sold-badge'))
+        if sold is not None:
+            if self.queries.get(name).get(url).get(minPrice).get(maxPrice).get(link):
+                del self.queries[name][url][minPrice][maxPrice][link]
+                return None, True
+            return None, False
+
+        location = self._parse_location(product, title)
+
+        # Check price constraints
+        if minPrice != "null" and price != "Unknown price" and price < int(minPrice):
+            return None, False
+        if maxPrice != "null" and price != "Unknown price" and price > int(maxPrice):
+            return None, False
+
+        # Check if this is a new item
+        if self.queries.get(name).get(url).get(minPrice).get(maxPrice).get(link):
+            return None, False
+
+        # Create message for new item
+        msg = (
+                datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + "\n"
+                + str(price) + "\n"
+                + title + "\n"
+                + location + "\n"
+                + link + '\n'
+        )
+
+        # Store the new item
+        self.queries[name][url][minPrice][maxPrice][link] = {
+            'title': title,
+            'price': price,
+            'location': location
+        }
+
+        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + f" Adding result: {title} - {price} - {location}")
+        return msg, False
+
     def run_query(self, url, name, notify, minPrice, maxPrice):
-        """A function to run a query
-
-        Arguments
-        ---------
-        url: str
-            the url to run the query on
-        name: str
-            the name of the query
-        notify: bool
-            whether to send notifications or not
-        minPrice: str
-            the minimum price to search for
-        maxPrice: str
-            the maximum price to search for
-
-        Example usage
-        -------------
-        >>> self.run_query("https://www.subito.it/annunci-italia/vendita/usato/?q=auto", "query", True, 100, "null")
-        """
-        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " running query (\"{}\" - {})...".format(name, url))
+        """Main query execution method"""
+        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + f" running query (\"{name}\" - {url})...")
 
         products_deleted = False
+        max_retries = 5
+        retry_delay = 3
 
-        page = requests.get(url)
-        soup = BeautifulSoup(page.text, 'html.parser')
-
-        product_list_items = soup.find_all('div', class_=re.compile(r'item-card'))
-        msg = []
-
-        for product in product_list_items:
-            title = product.find('h2').string
+        for attempt in range(max_retries):
             try:
-                price = product.find('p', class_=re.compile(r'price')).contents[0]
-                price = str(price)
-                # check if the span tag exists
-                price_soup = BeautifulSoup(price, 'html.parser')
-                if type(price_soup) == Tag:
+                response = self._make_request(url, attempt, retry_delay)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                product_list_items = soup.find_all('div', class_=re.compile(r'item-card'))
+
+                print(f"Found {len(product_list_items)} items")
+                if len(product_list_items) == 0:
+                    print("No products found, might be a detection issue. Response preview:")
+                    print(response.text[:500])
                     continue
-                # at the moment (20.5.2021) the price is under the 'p' tag with 'span' inside if shipping available
-                price = int(price.replace('.', '')[:-2])
-            except AttributeError:
-                price = "Unknown price"
-            link = product.find('a').get('href')
 
-            sold = product.find('span', re.compile(r'item-sold-badge'))
+                messages = []
+                for product in product_list_items:
+                    msg, deleted = self._handle_product(product, name, url, minPrice, maxPrice)
+                    if msg:
+                        messages.append(msg)
+                    products_deleted = products_deleted or deleted
 
-            # check if the product has already been sold
-            if sold is not None:
-                # if the product has previously been saved remove it from the file
-                if self.queries.get(name).get(url).get(minPrice).get(maxPrice).get(link):
-                    del self.queries[name][url][minPrice][maxPrice][link]
-                    products_deleted = True
-                continue
+                if messages:
+                    if notify:
+                        if self.telegram.is_telegram_active():
+                            self.telegram.send_telegram_messages(messages)
+                        print("\n".join(messages))
+                        print(f'\n{len(messages)} new elements have been found.')
+                    self.save_queries()
+                else:
+                    print('\nAll lists are already up to date.')
+                    if products_deleted:
+                        self.save_queries()
 
-            try:
-                town = product.find('span', re.compile(r'town')).string
-                city = product.find('span', re.compile(r'city')).string
-                location = town + city
-            except AttributeError:
-                print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " Unknown location for item %s" % title)
-                location = "Unknown location"
-            if minPrice == "null" or price == "Unknown price" or price >= int(minPrice):
-                if maxPrice == "null" or price == "Unknown price" or price <= int(maxPrice):
-                    if not self.queries.get(name).get(url).get(minPrice).get(maxPrice).get(link):  # found a new element
-                        tmp = (
-                                datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + "\n"
-                                + str(price) + "\n"
-                                + title + "\n"
-                                + location + "\n"
-                                + link + '\n'
-                        )
-                        msg.append(tmp)
-                        self.queries[name][url][minPrice][maxPrice][link] = {'title': title, 'price': price,
-                                                                             'location': location}
-                        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " Adding result:", title, "-", price, "-",
-                              location)
+                break
 
-        if len(msg) > 0:
-            if notify:
-                if self.telegram.is_telegram_active():
-                    self.telegram.send_telegram_messages(msg)
-                print("\n".join(msg))
-                print('\n{} new elements have been found.'.format(len(msg)))
-            self.save_queries()
-        else:
-            print('\nAll lists are already up to date.')
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed on attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(retry_delay * (attempt + 1))
 
-            # if at least one search was deleted, update the search file
-            if products_deleted:
-                self.save_queries()
-
-        # print("queries file saved: ", queries)
+            except Exception as e:
+                print(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
 
     def refresh(self, notify: bool):
         """A function to refresh the queries
@@ -219,3 +296,8 @@ class QueryManager:
             print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " ***HTTP error***")
         except Exception as e:
             print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " " + str(e))
+
+    def __del__(self):
+        """Cleanup method to properly close the session"""
+        if hasattr(self, 'session'):
+            self.session.close()
